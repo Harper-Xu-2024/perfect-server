@@ -7,5 +7,5 @@ This repository is published in order to share code and information and is inten
 ## Enhancements to mysqlbinlog:
 * Support for transaction analysis mode
 * Support for transaction rollback mode
-## SQL throttling tool improvements:
+## Additional SQL throttling plugin:
 * Added support for SQL requests limiting
