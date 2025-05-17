@@ -76,6 +76,10 @@
 
 using std::max;
 using std::min;
+std::string binlog_analysis_gtid;
+std::map<std::string, Binlog_analysis_info> binlog_analysis_map;
+std::vector<std::pair<std::string, Binlog_analysis_info>> binlog_analysis_vec;
+const size_t max_binlog_analysis_vec_size = 30;
 
 /**
   For storing information of the Format_description_event of the currently
@@ -787,6 +791,8 @@ enum Exit_status {
 */
 static char *opt_include_gtids_str = nullptr, *opt_exclude_gtids_str = nullptr;
 static bool opt_skip_gtids = false;
+static bool opt_analysis_mode = false;
+static bool opt_analysis_sort = false;
 static bool filter_based_on_gtids = false;
 static bool opt_require_row_format = false;
 
@@ -1088,6 +1094,33 @@ static bool shall_skip_database(const char *log_dbname) {
          strcmp(log_dbname, database);
 }
 
+static std::string my_getlocaltime(ulong ts) {
+  char datetime[18];
+  time_t ts_tmp = ts;
+  struct tm tm_tmp;
+  localtime_r(&ts_tmp, &tm_tmp);
+  snprintf(datetime, sizeof(datetime), "%04d%02d%02d %02d:%02d:%02d",
+           tm_tmp.tm_year + 1900, tm_tmp.tm_mon + 1, tm_tmp.tm_mday,
+           tm_tmp.tm_hour, tm_tmp.tm_min, tm_tmp.tm_sec);
+  return std::string(datetime);
+}
+
+void insert_binlog_analysis_info(const std::string &gtid,
+  const Binlog_analysis_info &analysis_info) {
+  if (binlog_analysis_vec.size() == max_binlog_analysis_vec_size) {
+    if (analysis_info.exec_time == 0)
+      return;
+  }
+  auto it = binlog_analysis_vec.begin();
+  while (it != binlog_analysis_vec.end() && it->second.exec_time >= analysis_info.exec_time) {
+    ++it;
+  }
+  binlog_analysis_vec.insert(it, std::make_pair(gtid, analysis_info));
+  if (binlog_analysis_vec.size() > max_binlog_analysis_vec_size) {
+        binlog_analysis_vec.pop_back();
+  }
+}
+
 /**
   Checks whether the given event should be filtered out,
   according to the include-gtids, exclude-gtids and
@@ -1361,6 +1394,7 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
   DBUG_TRACE;
   Exit_status retval = OK_CONTINUE;
   IO_CACHE *const head = &print_event_info->head_cache;
+  ev->is_analysis_mode= opt_analysis_mode;
 
   /*
     Format events are not concerned by --offset and such, we always need to
@@ -1661,16 +1695,18 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
               my_b_printf(body_cache, "'%s\n", print_event_info->delimiter);
 
             // flush cache
-            if ((copy_event_cache_to_file_and_reinit(
+            if (!opt_analysis_mode) {
+              if (copy_event_cache_to_file_and_reinit(
                      &print_event_info->head_cache, result_file,
                      stop_never /* flush result_file */) ||
-                 copy_event_cache_to_file_and_reinit(
+                  copy_event_cache_to_file_and_reinit(
                      &print_event_info->body_cache, result_file,
                      stop_never /* flush result_file */) ||
-                 copy_event_cache_to_file_and_reinit(
+                  copy_event_cache_to_file_and_reinit(
                      &print_event_info->footer_cache, result_file,
-                     stop_never /* flush result_file */)))
-              goto err;
+                     stop_never /* flush result_file */))
+                goto err;
+            }
           }
         }
 
@@ -1712,17 +1748,19 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
         /* Flush head,body and footer cache to result_file */
         if (stmt_end) {
           print_event_info->have_unflushed_events = false;
-          if (copy_event_cache_to_file_and_reinit(
-                  &print_event_info->head_cache, result_file,
-                  stop_never /* flush result file */) ||
-              copy_event_cache_to_file_and_reinit(
-                  &print_event_info->body_cache, result_file,
-                  stop_never /* flush result file */) ||
-              copy_event_cache_to_file_and_reinit(
-                  &print_event_info->footer_cache, result_file,
-                  stop_never /* flush result file */))
-            goto err;
-          goto end;
+          if (!opt_analysis_mode) {
+            if (copy_event_cache_to_file_and_reinit(
+                    &print_event_info->head_cache, result_file,
+                    stop_never /* flush result file */) ||
+                copy_event_cache_to_file_and_reinit(
+                    &print_event_info->body_cache, result_file,
+                    stop_never /* flush result file */) ||
+                copy_event_cache_to_file_and_reinit(
+                    &print_event_info->footer_cache, result_file,
+                    stop_never /* flush result file */))
+              goto err;
+            goto end;
+          }
         }
         break;
       }
@@ -1743,6 +1781,34 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
         print_event_info->skipped_event_in_transaction = false;
         seen_gtid = false;
         ev->print(result_file, print_event_info);
+        if (ev->is_analysis_mode) {
+          binlog_analysis_map[binlog_analysis_gtid].binlog_file =
+            std::string(logname);
+          if (opt_analysis_sort) {
+            insert_binlog_analysis_info(binlog_analysis_gtid,
+              binlog_analysis_map[binlog_analysis_gtid]);
+          } else {
+            for (const auto &entry : binlog_analysis_map) {
+                const std::string &gtid = entry.first;
+                const Binlog_analysis_info &info = entry.second;
+                printf("'%s':\n", gtid.c_str());
+                printf("  'binlog_file': '%s'\n", info.binlog_file.c_str());
+                printf("  'start_time': '%s'\n",
+                      my_getlocaltime((ulong)info.start_time.tv_sec).c_str());
+                printf("  'stop_time': '%s'\n",
+                      my_getlocaltime((ulong)info.stop_time.tv_sec).c_str());
+                printf("  'exec_time': %ld\n", info.exec_time);
+                printf("  'sql_statistics':\n");
+                for (const auto &sql_statistic : info.sql_statistics) {
+                  printf("    '%s':\n", sql_statistic.first.c_str());
+                  for (const auto &table : sql_statistic.second) {
+                    printf("      '%s': %d\n", table.first.c_str(), table.second);
+                  }
+                }
+            }
+          }
+          binlog_analysis_map.erase(binlog_analysis_gtid);
+        }
         if (head->error == -1) goto err;
         break;
       }
@@ -1760,10 +1826,12 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
         if (head->error == -1) goto err;
     }
     /* Flush head cache to result_file for every event */
-    if (copy_event_cache_to_file_and_reinit(&print_event_info->head_cache,
-                                            result_file,
-                                            stop_never /* flush result_file */))
-      goto err;
+    if (!opt_analysis_mode) {
+      if (copy_event_cache_to_file_and_reinit(&print_event_info->head_cache,
+                                              result_file,
+                                              stop_never /* flush result_file */))
+        goto err;
+    }
   }
 
   goto end;
@@ -2030,6 +2098,14 @@ static struct my_option my_long_options[] = {
      "Do not preserve Global Transaction Identifiers; instead make the server "
      "execute the transactions as if they were new.",
      &opt_skip_gtids, &opt_skip_gtids, nullptr, GET_BOOL, NO_ARG, 0, 0, 0,
+     nullptr, 0, nullptr},
+    {"analysis-mode", OPT_ANALYSIS_MODE,
+     "Set the analysis mode without the real data print.",
+     &opt_analysis_mode, &opt_analysis_mode, nullptr, GET_BOOL, NO_ARG, 0, 0, 0,
+     nullptr, 0, nullptr},
+    {"analysis-sort", OPT_ANALYSIS_SORT,
+     "Sort the binlog analysis information by the execution time.",
+     &opt_analysis_sort, &opt_analysis_sort, nullptr, GET_BOOL, NO_ARG, 0, 0, 0,
      nullptr, 0, nullptr},
     {"include-gtids", OPT_MYSQLBINLOG_INCLUDE_GTIDS,
      "Print events whose Global Transaction Identifiers "
@@ -2411,7 +2487,7 @@ static Exit_status dump_multiple_logs(int argc, char **argv) {
      Set safe delimiter, to dump things
      like CREATE PROCEDURE safely
   */
-  if (!raw_mode) {
+  if (!raw_mode && !opt_analysis_mode) {
     fprintf(result_file, "DELIMITER /*!*/;\n");
   }
   my_stpcpy(print_event_info.delimiter, "/*!*/;");
@@ -2457,7 +2533,7 @@ static Exit_status dump_multiple_logs(int argc, char **argv) {
         "from the partial statement have not been written to output.");
 
   /* Set delimiter back to semicolon */
-  if (!raw_mode) {
+  if (!raw_mode && !opt_analysis_mode) {
     if (print_event_info.skipped_event_in_transaction)
       fprintf(result_file, "COMMIT /* added by mysqlbinlog */%s\n",
               print_event_info.delimiter);
@@ -3274,7 +3350,7 @@ int main(int argc, char **argv) {
   else
     load_processor.init_by_cur_dir();
 
-  if (!raw_mode) {
+  if (!raw_mode && !opt_analysis_mode) {
     fprintf(
         result_file,
         "# The proper term is pseudo_replica_mode, but we use this "
@@ -3309,17 +3385,17 @@ int main(int argc, char **argv) {
     In case '--idempotent' or '-i' options has been used, we will notify the
     server to use idempotent mode for the following events.
    */
-  if (idempotent_mode)
+  if (idempotent_mode && !opt_analysis_mode)
     fprintf(result_file,
             "/*!50700 SET @@SESSION.RBR_EXEC_MODE=IDEMPOTENT*/;\n\n");
 
-  if (opt_require_row_format) {
+  if (opt_require_row_format && !opt_analysis_mode) {
     fprintf(result_file, "/*!80019 SET @@SESSION.REQUIRE_ROW_FORMAT=1*/;\n\n");
   }
 
   retval = dump_multiple_logs(argc, argv);
 
-  if (!raw_mode) {
+  if (!raw_mode && !opt_analysis_mode) {
     fprintf(result_file, "# End of log file\n");
 
     fprintf(result_file,
@@ -3337,11 +3413,32 @@ int main(int argc, char **argv) {
     fprintf(result_file, "/*!50530 SET @@SESSION.PSEUDO_SLAVE_MODE=0*/;\n");
   }
 
+  if (opt_analysis_mode && opt_analysis_sort) {
+    for (const auto &entry : binlog_analysis_vec) {
+      const std::string &gtid = entry.first;
+      const Binlog_analysis_info &info = entry.second;
+      printf("'%s':\n", gtid.c_str());
+      printf("  'binlog_file': '%s'\n", info.binlog_file.c_str());
+      printf("  'start_time': '%s'\n",
+      my_getlocaltime((ulong)info.start_time.tv_sec).c_str());
+      printf("  'stop_time': '%s'\n",
+      my_getlocaltime((ulong)info.stop_time.tv_sec).c_str());
+      printf("  'exec_time': %ld\n", info.exec_time);
+      printf("  'sql_statistics':\n");
+      for (const auto &sql_statistic : info.sql_statistics) {
+        printf("    '%s':\n", sql_statistic.first.c_str());
+        for (const auto &table : sql_statistic.second) {
+          printf("      '%s': %d\n", table.first.c_str(), table.second);
+        }
+      }
+    }
+  }
+
   /*
     We should unset the RBR_EXEC_MODE since the user may concatenate output of
     multiple runs of mysqlbinlog, all of which may not run in idempotent mode.
    */
-  if (idempotent_mode)
+  if (idempotent_mode && !opt_analysis_mode)
     fprintf(result_file, "/*!50700 SET @@SESSION.RBR_EXEC_MODE=STRICT*/;\n");
 
   if (tmpdir.list) free_tmpdir(&tmpdir);

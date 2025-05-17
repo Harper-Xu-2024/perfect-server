@@ -2352,25 +2352,30 @@ void Rows_log_event::print_verbose(IO_CACHE *file,
     my_b_printf(file, "\n");
   }
 
+  std::string sql_type;
   switch (general_type_code) {
     case binary_log::WRITE_ROWS_EVENT:
       sql_command = "INSERT INTO";
       sql_clause1 = "### SET\n";
       sql_clause2 = nullptr;
+      sql_type = "insert";
       break;
     case binary_log::DELETE_ROWS_EVENT:
       sql_command = "DELETE FROM";
       sql_clause1 = "### WHERE\n";
       sql_clause2 = nullptr;
+      sql_type = "delete";
       break;
     case binary_log::UPDATE_ROWS_EVENT:
     case binary_log::PARTIAL_UPDATE_ROWS_EVENT:
       sql_command = "UPDATE";
       sql_clause1 = "### WHERE\n";
       sql_clause2 = "### SET\n";
+      sql_type = "update";
       break;
     default:
       sql_command = sql_clause1 = sql_clause2 = nullptr;
+      sql_type = "unknown";
       assert(0); /* Not possible */
   }
 
@@ -2382,6 +2387,9 @@ void Rows_log_event::print_verbose(IO_CACHE *file,
     return;
   }
 
+  std::string analysis_table = std::string(map->get_db_name()) + '.' +
+                               map->get_table_name();
+
   /* If the write rows event contained no values for the AI */
   if (((general_type_code == binary_log::WRITE_ROWS_EVENT) &&
        (m_rows_buf == m_rows_end))) {
@@ -2391,6 +2399,7 @@ void Rows_log_event::print_verbose(IO_CACHE *file,
   }
 
   for (const uchar *value = m_rows_buf; value < m_rows_end;) {
+    binlog_analysis_map[binlog_analysis_gtid].sql_statistics[sql_type][analysis_table]++;
     size_t length;
     quoted_db_len =
         my_strmov_quoted_identifier((char *)quoted_db, map->get_db_name());
@@ -2512,6 +2521,13 @@ void Log_event::print_timestamp(IO_CACHE *file, time_t *ts) const {
   my_b_printf(file, "%02d%02d%02d %2d:%02d:%02d", res->tm_year % 100,
               res->tm_mon + 1, res->tm_mday, res->tm_hour, res->tm_min,
               res->tm_sec);
+  if (is_analysis_mode) {
+    Log_event_type ev_type = get_type_code();
+    if (ev_type == binary_log::QUERY_EVENT)
+      binlog_analysis_map[binlog_analysis_gtid].start_time = common_header->when;
+    if (ev_type == binary_log::XID_EVENT)
+      binlog_analysis_map[binlog_analysis_gtid].stop_time = common_header->when;
+  }
 }
 
 #endif /* !MYSQL_SERVER */
@@ -4213,6 +4229,8 @@ void Query_log_event::print_query_header(
       longlong10_to_str(ddl_xid, xid_buf + strlen(xid_assign), 10);
     }
     print_header(file, print_event_info, false);
+    if (is_analysis_mode)
+      binlog_analysis_map[binlog_analysis_gtid].exec_time = exec_time;
     my_b_printf(file, "\t%s\tthread_id=%lu\texec_time=%lu\terror_code=%d%s\n",
                 get_type_str(), (ulong)thread_id, (ulong)exec_time, error_code,
                 xid_buf);
@@ -12865,6 +12883,7 @@ size_t Gtid_log_event::to_string(char *buf) const {
 #ifndef MYSQL_SERVER
 void Gtid_log_event::print(FILE *, PRINT_EVENT_INFO *print_event_info) const {
   char buffer[MAX_SET_STRING_LENGTH + 1];
+  char gtid_buf[MAX_GTID_STRING + 1];
   IO_CACHE *const head = &print_event_info->head_cache;
   if (!print_event_info->short_form) {
     print_header(head, print_event_info, false);
@@ -12932,6 +12951,10 @@ void Gtid_log_event::print(FILE *, PRINT_EVENT_INFO *print_event_info) const {
               immediate_server_version, print_event_info->delimiter);
 
   to_string(buffer);
+  char *p = gtid_buf;
+  p += spec.to_string(&sid, p);
+  *p = '\0';
+  binlog_analysis_gtid = std::string(gtid_buf);
   my_b_printf(head, "%s%s\n", buffer, print_event_info->delimiter);
 }
 #endif

@@ -40,6 +40,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <regex>
 
 #include "lex_string.h"
 #include "libbinlogevents/include/binlog_event.h"
@@ -109,6 +110,18 @@ class Format_description_log_event;
 extern PSI_memory_key key_memory_Incident_log_event_message;
 extern PSI_memory_key key_memory_Rows_query_log_event_rows_query;
 extern "C" MYSQL_PLUGIN_IMPORT ulong server_id;
+extern std::string binlog_analysis_gtid;
+struct Binlog_analysis_info {
+    std::string binlog_file;
+    struct timeval start_time;
+    struct timeval stop_time;
+    ulong exec_time;
+
+    std::map<std::string, std::map<std::string, int>> sql_statistics;
+};
+extern std::map<std::string, Binlog_analysis_info> binlog_analysis_map;
+extern std::vector<std::pair<std::string, Binlog_analysis_info>> binlog_analysis_vec;
+extern const size_t max_binlog_analysis_vec_size;
 
 /* Forward declarations */
 using binary_log::Binary_log_event;
@@ -837,6 +850,11 @@ class Log_event {
   */
   ulonglong future_event_relay_log_pos;
 
+  /**
+    The following is used to analyze binlog or rollback the specified
+    transactions.
+  */
+  bool is_analysis_mode;
 #ifdef MYSQL_SERVER
   THD *thd;
   /**
@@ -3979,6 +3997,8 @@ class Gtid_log_event : public binary_log::Gtid_event, public Log_event {
   static const size_t MAX_SET_STRING_LENGTH = SET_STRING_PREFIX_LENGTH +
                                               binary_log::Uuid::TEXT_LENGTH +
                                               1 + MAX_GNO_TEXT_LENGTH + 1;
+  static const size_t MAX_GTID_STRING = binary_log::Uuid::TEXT_LENGTH + 1 +
+                                        MAX_GNO_TEXT_LENGTH + 1;
 
  private:
   /**
