@@ -40,7 +40,6 @@
 #include <map>
 #include <set>
 #include <string>
-#include <regex>
 
 #include "lex_string.h"
 #include "libbinlogevents/include/binlog_event.h"
@@ -110,7 +109,7 @@ class Format_description_log_event;
 extern PSI_memory_key key_memory_Incident_log_event_message;
 extern PSI_memory_key key_memory_Rows_query_log_event_rows_query;
 extern "C" MYSQL_PLUGIN_IMPORT ulong server_id;
-extern std::string binlog_analysis_gtid;
+extern std::string current_gtid;
 struct Binlog_analysis_info {
     std::string binlog_file;
     struct timeval start_time;
@@ -119,7 +118,7 @@ struct Binlog_analysis_info {
 
     std::map<std::string, std::map<std::string, int>> sql_statistics;
 };
-extern std::map<std::string, Binlog_analysis_info> binlog_analysis_map;
+extern Binlog_analysis_info current_analysis_info;
 extern std::vector<std::pair<std::string, Binlog_analysis_info>> binlog_analysis_vec;
 extern const size_t max_binlog_analysis_vec_size;
 

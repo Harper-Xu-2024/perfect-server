@@ -76,8 +76,8 @@
 
 using std::max;
 using std::min;
-std::string binlog_analysis_gtid;
-std::map<std::string, Binlog_analysis_info> binlog_analysis_map;
+std::string current_gtid;
+Binlog_analysis_info current_analysis_info;
 std::vector<std::pair<std::string, Binlog_analysis_info>> binlog_analysis_vec;
 const size_t max_binlog_analysis_vec_size = 30;
 
@@ -1112,7 +1112,8 @@ void insert_binlog_analysis_info(const std::string &gtid,
       return;
   }
   auto it = binlog_analysis_vec.begin();
-  while (it != binlog_analysis_vec.end() && it->second.exec_time >= analysis_info.exec_time) {
+  while (it != binlog_analysis_vec.end() &&
+         it->second.exec_time >= analysis_info.exec_time) {
     ++it;
   }
   binlog_analysis_vec.insert(it, std::make_pair(gtid, analysis_info));
@@ -1394,7 +1395,7 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
   DBUG_TRACE;
   Exit_status retval = OK_CONTINUE;
   IO_CACHE *const head = &print_event_info->head_cache;
-  ev->is_analysis_mode= opt_analysis_mode;
+  ev->is_analysis_mode = opt_analysis_mode;
 
   /*
     Format events are not concerned by --offset and such, we always need to
@@ -1782,32 +1783,32 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
         seen_gtid = false;
         ev->print(result_file, print_event_info);
         if (ev->is_analysis_mode) {
-          binlog_analysis_map[binlog_analysis_gtid].binlog_file =
-            std::string(logname);
+          current_analysis_info.binlog_file = std::string(logname);
           if (opt_analysis_sort) {
-            insert_binlog_analysis_info(binlog_analysis_gtid,
-              binlog_analysis_map[binlog_analysis_gtid]);
+            insert_binlog_analysis_info(current_gtid,
+                                        current_analysis_info);
           } else {
-            for (const auto &entry : binlog_analysis_map) {
-                const std::string &gtid = entry.first;
-                const Binlog_analysis_info &info = entry.second;
-                printf("'%s':\n", gtid.c_str());
-                printf("  'binlog_file': '%s'\n", info.binlog_file.c_str());
-                printf("  'start_time': '%s'\n",
-                      my_getlocaltime((ulong)info.start_time.tv_sec).c_str());
-                printf("  'stop_time': '%s'\n",
-                      my_getlocaltime((ulong)info.stop_time.tv_sec).c_str());
-                printf("  'exec_time': %ld\n", info.exec_time);
-                printf("  'sql_statistics':\n");
-                for (const auto &sql_statistic : info.sql_statistics) {
-                  printf("    '%s':\n", sql_statistic.first.c_str());
-                  for (const auto &table : sql_statistic.second) {
-                    printf("      '%s': %d\n", table.first.c_str(), table.second);
-                  }
-                }
+            printf("'%s':\n", current_gtid.c_str());
+            printf("  'binlog_file': '%s'\n",
+                   current_analysis_info.binlog_file.c_str());
+            printf("  'start_time': '%s'\n",
+                   my_getlocaltime((ulong)
+                   current_analysis_info.start_time.tv_sec).c_str());
+            printf("  'stop_time': '%s'\n",
+                   my_getlocaltime((ulong)
+                   current_analysis_info.stop_time.tv_sec).c_str());
+            printf("  'exec_time': %ld\n",
+                   current_analysis_info.exec_time);
+            printf("  'sql_statistics':\n");
+            for (const auto &sql_statistic :
+              current_analysis_info.sql_statistics) {
+              printf("    '%s':\n", sql_statistic.first.c_str());
+              for (const auto &table : sql_statistic.second) {
+                printf("      '%s': %d\n", table.first.c_str(), table.second);
+              }
             }
           }
-          binlog_analysis_map.erase(binlog_analysis_gtid);
+          current_analysis_info.sql_statistics.clear();
         }
         if (head->error == -1) goto err;
         break;
@@ -3322,6 +3323,14 @@ int main(int argc, char **argv) {
   if ((argc == 1) && (stop_position != (ulonglong)(~(my_off_t)0)) &&
       (!strcmp(argv[0], "-"))) {
     error("stop_position not allowed when input is STDIN");
+    return EXIT_FAILURE;
+  }
+  if (opt_analysis_mode && verbose == 0) {
+    error("The --analysis-mode option requires --verbose");
+    return EXIT_FAILURE;
+  }
+  if (!opt_analysis_mode && opt_analysis_sort) {
+    error("The --analysis-sort option is only allowed with --analysis-mode");
     return EXIT_FAILURE;
   }
 
