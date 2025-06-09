@@ -1574,11 +1574,16 @@ static bool my_b_write_quoted(IO_CACHE *file, const uchar *ptr, uint length) {
   const uchar *s;
   static const uchar *quote_table = get_quote_table();
   my_b_printf(file, "'");
+  std::string column_value = "'";
   for (s = ptr; length > 0; s++, length--) {
     const uchar *len_and_str = quote_table + *s * 5;
     my_b_write(file, len_and_str + 1, len_and_str[0]);
+    column_value.append(reinterpret_cast<const char *>(len_and_str + 1),
+                        len_and_str[0]);
   }
   if (my_b_printf(file, "'") == (size_t)-1) return true;
+  column_value += "'";
+  rollback_sql_columns.push_back(column_value);
   return false;
 }
 
@@ -1592,11 +1597,15 @@ static bool my_b_write_quoted(IO_CACHE *file, const uchar *ptr, uint length) {
 static void my_b_write_bit(IO_CACHE *file, const uchar *ptr, uint nbits) {
   uint bitnum, nbits8 = ((nbits + 7) / 8) * 8, skip_bits = nbits8 - nbits;
   my_b_printf(file, "b'");
+  std::string column_value = "b'";
   for (bitnum = skip_bits; bitnum < nbits8; bitnum++) {
     int is_set = (ptr[(bitnum) / 8] >> (7 - bitnum % 8)) & 0x01;
     my_b_write(file, (const uchar *)(is_set ? "1" : "0"), 1);
+    column_value += is_set ? "1" : "0";
   }
   my_b_printf(file, "'");
+  column_value += "'";
+  rollback_sql_columns.push_back(column_value);
 }
 
 /**
@@ -1632,7 +1641,12 @@ static size_t my_b_write_quoted_with_length(IO_CACHE *file, const uchar *ptr,
 */
 static void my_b_write_sint32_and_uint32(IO_CACHE *file, int32 si, uint32 ui) {
   my_b_printf(file, "%d", si);
-  if (si < 0) my_b_printf(file, " (%u)", ui);
+  std::string column_value = std::to_string(si);
+  if (si < 0) {
+    my_b_printf(file, " (%u)", ui);
+    column_value += " (" + std::to_string(ui) + ")";
+  }
+  rollback_sql_columns.push_back(column_value);
 }
 
 #ifndef MYSQL_SERVER
@@ -1879,7 +1893,10 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
   switch (type) {
     case MYSQL_TYPE_LONG: {
       snprintf(typestr, typestr_length, "INT");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       int32 si = sint4korr(ptr);
       uint32 ui = uint4korr(ptr);
       my_b_write_sint32_and_uint32(file, si, ui);
@@ -1888,7 +1905,10 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
 
     case MYSQL_TYPE_TINY: {
       snprintf(typestr, typestr_length, "TINYINT");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       my_b_write_sint32_and_uint32(file, (int)(signed char)*ptr,
                                    (uint)(unsigned char)*ptr);
       return 1;
@@ -1896,7 +1916,10 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
 
     case MYSQL_TYPE_SHORT: {
       snprintf(typestr, typestr_length, "SHORTINT");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       int32 si = (int32)sint2korr(ptr);
       uint32 ui = (uint32)uint2korr(ptr);
       my_b_write_sint32_and_uint32(file, si, ui);
@@ -1905,7 +1928,10 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
 
     case MYSQL_TYPE_INT24: {
       snprintf(typestr, typestr_length, "MEDIUMINT");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       int32 si = sint3korr(ptr);
       uint32 ui = uint3korr(ptr);
       my_b_write_sint32_and_uint32(file, si, ui);
@@ -1914,16 +1940,22 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
 
     case MYSQL_TYPE_LONGLONG: {
       snprintf(typestr, typestr_length, "LONGINT");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       char tmp[64];
       longlong si = sint8korr(ptr);
       longlong10_to_str(si, tmp, -10);
       my_b_printf(file, "%s", tmp);
+      std::string column_value = tmp;
       if (si < 0) {
         ulonglong ui = uint8korr(ptr);
         longlong10_to_str((longlong)ui, tmp, 10);
         my_b_printf(file, " (%s)", tmp);
+        column_value += " (" + std::string(tmp) + ")";
       }
+      rollback_sql_columns.push_back(column_value);
       return 8;
     }
 
@@ -1931,7 +1963,10 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
       uint precision = meta >> 8;
       uint decimals = meta & 0xFF;
       snprintf(typestr, typestr_length, "DECIMAL(%d,%d)", precision, decimals);
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       uint bin_size = my_decimal_get_binary_size(precision, decimals);
       my_decimal dec;
       binary2my_decimal(E_DEC_FATAL_ERROR, pointer_cast<const uchar *>(ptr),
@@ -1940,26 +1975,35 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
       int len = sizeof(buff);
       decimal2string(&dec, buff, &len);
       my_b_printf(file, "%s", buff);
+      rollback_sql_columns.push_back(std::string(buff));
       return bin_size;
     }
 
     case MYSQL_TYPE_FLOAT: {
       snprintf(typestr, typestr_length, "FLOAT");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       float fl = float4get(ptr);
       char tmp[320];
       sprintf(tmp, "%-20g", (double)fl);
       my_b_printf(file, "%s", tmp); /* my_b_printf doesn't support %-20g */
+      rollback_sql_columns.push_back(std::string(tmp));
       return 4;
     }
 
     case MYSQL_TYPE_DOUBLE: {
       strcpy(typestr, "DOUBLE");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       double dbl = float8get(ptr);
       char tmp[320];
       sprintf(tmp, "%-.20g", dbl); /* my_b_printf doesn't support %-20g */
       my_b_printf(file, "%s", tmp);
+      rollback_sql_columns.push_back(std::string(tmp));
       return 8;
     }
 
@@ -1967,7 +2011,10 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
       /* Meta-data: bit_len, bytes_in_rec, 2 bytes */
       uint nbits = ((meta >> 8) * 8) + (meta & 0xFF);
       snprintf(typestr, typestr_length, "BIT(%d)", nbits);
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       length = (nbits + 7) / 8;
       my_b_write_bit(file, ptr, nbits);
       return length;
@@ -1975,41 +2022,58 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
 
     case MYSQL_TYPE_TIMESTAMP: {
       snprintf(typestr, typestr_length, "TIMESTAMP");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       uint32 i32 = uint4korr(ptr);
       my_b_printf(file, "%d", i32);
+      rollback_sql_columns.push_back(std::to_string(i32));
       return 4;
     }
 
     case MYSQL_TYPE_TIMESTAMP2: {
       snprintf(typestr, typestr_length, "TIMESTAMP(%d)", meta);
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       char buf[MAX_DATE_STRING_REP_LENGTH];
       my_timeval tm;
       my_timestamp_from_binary(&tm, ptr, meta);
       int buflen = my_timeval_to_str(&tm, buf, meta);
       my_b_write(file, pointer_cast<uchar *>(buf), buflen);
+      rollback_sql_columns.push_back(std::string(buf, buflen));
       return my_timestamp_binary_length(meta);
     }
 
     case MYSQL_TYPE_DATETIME: {
       snprintf(typestr, typestr_length, "DATETIME");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       size_t d, t;
       uint64 i64 = uint8korr(ptr); /* YYYYMMDDhhmmss */
       d = static_cast<size_t>(i64 / 1000000);
       t = i64 % 1000000;
-      my_b_printf(file, "%04d-%02d-%02d %02d:%02d:%02d",
-                  static_cast<int>(d / 10000),
-                  static_cast<int>(d % 10000) / 100, static_cast<int>(d % 100),
-                  static_cast<int>(t / 10000),
-                  static_cast<int>(t % 10000) / 100, static_cast<int>(t % 100));
+      char datetime_str[20];
+      snprintf(datetime_str, sizeof(datetime_str), "%04d-%02d-%02d %02d:%02d:%02d",
+               static_cast<int>(d / 10000),
+               static_cast<int>(d % 10000) / 100, static_cast<int>(d % 100),
+               static_cast<int>(t / 10000),
+               static_cast<int>(t % 10000) / 100, static_cast<int>(t % 100));
+      my_b_printf(file, "%s", datetime_str);
+      rollback_sql_columns.push_back(std::string(datetime_str));
       return 8;
     }
 
     case MYSQL_TYPE_DATETIME2: {
       snprintf(typestr, typestr_length, "DATETIME(%d)", meta);
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       char buf[MAX_DATE_STRING_REP_LENGTH];
       MYSQL_TIME ltime;
       longlong packed = my_datetime_packed_from_binary(ptr, meta);
@@ -2021,16 +2085,25 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
 
     case MYSQL_TYPE_TIME: {
       snprintf(typestr, typestr_length, "TIME");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       uint32 i32 = uint3korr(ptr);
-      my_b_printf(file, "'%02d:%02d:%02d'", i32 / 10000, (i32 % 10000) / 100,
-                  i32 % 100);
+      char time_str[11];
+      snprintf(time_str, sizeof(time_str), "'%02d:%02d:%02d'",
+               i32 / 10000, (i32 % 10000) / 100, i32 % 100);
+      my_b_printf(file, "%s", time_str);
+      rollback_sql_columns.push_back(std::string(time_str));
       return 3;
     }
 
     case MYSQL_TYPE_TIME2: {
       snprintf(typestr, typestr_length, "TIME(%d)", meta);
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       char buf[MAX_DATE_STRING_REP_LENGTH];
       MYSQL_TIME ltime;
       longlong packed = my_time_packed_from_binary(ptr, meta);
@@ -2042,7 +2115,10 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
 
     case MYSQL_TYPE_NEWDATE: {
       snprintf(typestr, typestr_length, "DATE");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       uint32 tmp = uint3korr(ptr);
       int part;
       char buf[11];
@@ -2067,14 +2143,21 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
       part /= 10;
       *pos = (char)('0' + part);
       my_b_printf(file, "'%s'", buf);
+      rollback_sql_columns.push_back(std::string(buf));
       return 3;
     }
 
     case MYSQL_TYPE_YEAR: {
       snprintf(typestr, typestr_length, "YEAR");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       uint32 i32 = *ptr;
-      my_b_printf(file, "%04d", i32 + 1900);
+      char year_str[5];
+      snprintf(year_str, sizeof(year_str), "%04d", i32 + 1900);
+      my_b_printf(file, "'%s'", year_str);
+      rollback_sql_columns.push_back(std::string(year_str));
       return 1;
     }
 
@@ -2082,14 +2165,22 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
       switch (meta & 0xFF) {
         case 1:
           snprintf(typestr, typestr_length, "ENUM(1 byte)");
-          if (!ptr) return my_b_printf(file, "NULL");
+          if (!ptr) {
+            rollback_sql_columns.push_back("NULL");
+            return my_b_printf(file, "NULL");
+          }
           my_b_printf(file, "%d", (int)*ptr);
+          rollback_sql_columns.push_back(std::to_string((int)*ptr));
           return 1;
         case 2: {
           snprintf(typestr, typestr_length, "ENUM(2 bytes)");
-          if (!ptr) return my_b_printf(file, "NULL");
+          if (!ptr) {
+            rollback_sql_columns.push_back("NULL");
+            return my_b_printf(file, "NULL");
+          }
           int32 i32 = uint2korr(ptr);
           my_b_printf(file, "%d", i32);
+          rollback_sql_columns.push_back(std::to_string(i32));
           return 2;
         }
         default:
@@ -2100,7 +2191,10 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
 
     case MYSQL_TYPE_SET:
       snprintf(typestr, typestr_length, "SET(%d bytes)", meta & 0xFF);
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       my_b_write_bit(file, ptr, (meta & 0xFF) * 8);
       return meta & 0xFF;
 
@@ -2108,25 +2202,37 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
       switch (meta) {
         case 1:
           snprintf(typestr, typestr_length, "TINYBLOB/TINYTEXT");
-          if (!ptr) return my_b_printf(file, "NULL");
+          if (!ptr) {
+            rollback_sql_columns.push_back("NULL");
+            return my_b_printf(file, "NULL");
+          }
           length = *ptr;
           my_b_write_quoted(file, ptr + 1, length);
           return length + 1;
         case 2:
           snprintf(typestr, typestr_length, "BLOB/TEXT");
-          if (!ptr) return my_b_printf(file, "NULL");
+          if (!ptr) {
+            rollback_sql_columns.push_back("NULL");
+            return my_b_printf(file, "NULL");
+          }
           length = uint2korr(ptr);
           my_b_write_quoted(file, ptr + 2, length);
           return length + 2;
         case 3:
           snprintf(typestr, typestr_length, "MEDIUMBLOB/MEDIUMTEXT");
-          if (!ptr) return my_b_printf(file, "NULL");
+          if (!ptr) {
+            rollback_sql_columns.push_back("NULL");
+            return my_b_printf(file, "NULL");
+          }
           length = uint3korr(ptr);
           my_b_write_quoted(file, ptr + 3, length);
           return length + 3;
         case 4:
           snprintf(typestr, typestr_length, "LONGBLOB/LONGTEXT");
-          if (!ptr) return my_b_printf(file, "NULL");
+          if (!ptr) {
+            rollback_sql_columns.push_back("NULL");
+            return my_b_printf(file, "NULL");
+          }
           length = uint4korr(ptr);
           my_b_write_quoted(file, ptr + 4, length);
           return length + 4;
@@ -2139,17 +2245,26 @@ static size_t log_event_print_value(IO_CACHE *file, const uchar *ptr, uint type,
     case MYSQL_TYPE_VAR_STRING:
       length = meta;
       snprintf(typestr, typestr_length, "VARSTRING(%d)", length);
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       return my_b_write_quoted_with_length(file, ptr, length);
 
     case MYSQL_TYPE_STRING:
       snprintf(typestr, typestr_length, "STRING(%d)", length);
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       return my_b_write_quoted_with_length(file, ptr, length);
 
     case MYSQL_TYPE_JSON: {
       snprintf(typestr, typestr_length, "JSON");
-      if (!ptr) return my_b_printf(file, "NULL");
+      if (!ptr) {
+        rollback_sql_columns.push_back("NULL");
+        return my_b_printf(file, "NULL");
+      }
       length = uint4korr(ptr);
       ptr += 4;
       if (is_partial) {
@@ -2353,6 +2468,7 @@ void Rows_log_event::print_verbose(IO_CACHE *file,
   }
 
   std::string sql_type;
+  std::string rollback_sql_prefix;
   switch (general_type_code) {
     case binary_log::WRITE_ROWS_EVENT:
       sql_command = "INSERT INTO";
@@ -2360,6 +2476,8 @@ void Rows_log_event::print_verbose(IO_CACHE *file,
       sql_clause2 = nullptr;
       if (is_analysis_mode)
        sql_type = "insert";
+      if (is_rollback_mode)
+        rollback_sql_prefix = "DELETE FROM ";
       break;
     case binary_log::DELETE_ROWS_EVENT:
       sql_command = "DELETE FROM";
@@ -2367,6 +2485,8 @@ void Rows_log_event::print_verbose(IO_CACHE *file,
       sql_clause2 = nullptr;
       if (is_analysis_mode)
         sql_type = "delete";
+      if (is_rollback_mode)
+        rollback_sql_prefix = "INSERT INTO ";
       break;
     case binary_log::UPDATE_ROWS_EVENT:
     case binary_log::PARTIAL_UPDATE_ROWS_EVENT:
@@ -2375,6 +2495,8 @@ void Rows_log_event::print_verbose(IO_CACHE *file,
       sql_clause2 = "### SET\n";
       if (is_analysis_mode)
         sql_type = "update";
+      if (is_rollback_mode)
+        rollback_sql_prefix = "UPDATE ";
       break;
     default:
       sql_command = sql_clause1 = sql_clause2 = nullptr;
@@ -2392,9 +2514,11 @@ void Rows_log_event::print_verbose(IO_CACHE *file,
   }
 
   std::string analysis_table;
-  if (is_analysis_mode) {
+  if (is_analysis_mode || is_rollback_mode) {
     analysis_table = std::string(map->get_db_name()) +
                                  '.' + map->get_table_name();
+    if (is_rollback_mode)
+      rollback_sql_prefix += analysis_table;
   }
 
   /* If the write rows event contained no values for the AI */
@@ -2431,6 +2555,63 @@ void Rows_log_event::print_verbose(IO_CACHE *file,
         goto end;
       value += length;
     }
+    if (!is_rollback_mode) {
+      continue;
+    }
+    if (general_type_code == binary_log::DELETE_ROWS_EVENT) {
+      rollback_sql = rollback_sql_prefix + " values(";
+      for (size_t i = 0; i < rollback_sql_columns.size(); ++i) {
+        rollback_sql += rollback_sql_columns[i];
+        if (i < rollback_sql_columns.size() - 1)
+          rollback_sql += ", ";
+      }
+      rollback_sql += ");";
+    }
+    if (general_type_code == binary_log::WRITE_ROWS_EVENT) {
+      rollback_sql = rollback_sql_prefix + " where ";
+      for (size_t i = 0; i < rollback_sql_columns.size(); ++i) {
+        std::string column_condition = rollback_column_names[i] + "=" +
+                                       rollback_sql_columns[i];
+        rollback_sql += column_condition;
+        if (i < rollback_sql_columns.size() - 1)
+          rollback_sql += ", ";
+      }
+      rollback_sql += ";";
+    }
+    if (general_type_code == binary_log::UPDATE_ROWS_EVENT ||
+        general_type_code == binary_log::PARTIAL_UPDATE_ROWS_EVENT) {
+      rollback_sql = rollback_sql_prefix + " set ";
+      size_t mid_position =
+          rollback_sql_columns.size() / 2;  // Half of the columns
+      bool is_skip_update = true;
+      for (size_t i = 0; i < mid_position; ++i) {
+        if (rollback_sql_columns[i] == rollback_sql_columns[i + mid_position]) {
+          continue;  // No change, skip
+        }
+        if (!is_skip_update)
+          rollback_sql += ", ";
+        is_skip_update = false;  // At least one column changed
+        std::string column_condition = rollback_column_names[i] + "=" +
+                                       rollback_sql_columns[i + mid_position];
+        rollback_sql += column_condition;
+      }
+      if (is_skip_update) {
+        rollback_sql = ""; // No need to update, skip
+        goto end;
+      }
+      rollback_sql += " where ";
+      for (size_t i = 0; i < mid_position; ++i) {
+        std::string column_condition =
+            rollback_column_names[i] + "=" + rollback_sql_columns[i];
+        rollback_sql += column_condition;
+        if (i < mid_position - 1)
+          rollback_sql += " and ";
+      }
+      rollback_sql += ";";
+    }
+    rollback_transaction.second.push_back(rollback_sql);
+    rollback_sql_columns.clear();
+    rollback_sql.clear();
   }
 
 end:
@@ -2503,6 +2684,7 @@ void Log_event::print_base64(IO_CACHE *file, PRINT_EVENT_INFO *print_event_info,
 
     if (ev) {
       ev->is_analysis_mode = is_analysis_mode;
+      ev->is_rollback_mode = is_rollback_mode;
       ev->print_verbose(&print_event_info->footer_cache, print_event_info);
       delete ev;
     }
@@ -12960,7 +13142,7 @@ void Gtid_log_event::print(FILE *, PRINT_EVENT_INFO *print_event_info) const {
               immediate_server_version, print_event_info->delimiter);
 
   to_string(buffer);
-  if (is_analysis_mode) {
+  if (is_analysis_mode || is_rollback_mode) {
     char *p = gtid_buf;
     p += spec.to_string(&sid, p);
     *p = '\0';

@@ -80,6 +80,11 @@ std::string current_gtid;
 Binlog_analysis_info current_analysis_info;
 std::vector<std::pair<std::string, Binlog_analysis_info>> binlog_analysis_vec;
 const size_t max_binlog_analysis_vec_size = 30;
+std::string rollback_sql;
+std::vector<std::string> rollback_sql_columns;
+std::vector<std::string> rollback_column_names;
+std::pair<std::string, std::vector<std::string>> rollback_transaction;
+std::vector<std::pair<std::string, std::vector<std::string>>> rollback_transactions;
 
 /**
   For storing information of the Format_description_event of the currently
@@ -762,6 +767,7 @@ static char *start_datetime_str, *stop_datetime_str;
 static my_time_t start_datetime = 0, stop_datetime = MYTIME_MAX_VALUE;
 static ulonglong rec_count = 0;
 static MYSQL *mysql = nullptr;
+static MYSQL *mysql_for_rollback = nullptr;
 static char *dirname_for_local_load = nullptr;
 static uint opt_server_id_bits = 0;
 ulong opt_server_id_mask = 0;
@@ -793,6 +799,7 @@ static char *opt_include_gtids_str = nullptr, *opt_exclude_gtids_str = nullptr;
 static bool opt_skip_gtids = false;
 static bool opt_analysis_mode = false;
 static bool opt_analysis_sort = false;
+static bool opt_rollback_mode = false;
 static bool filter_based_on_gtids = false;
 static bool opt_require_row_format = false;
 
@@ -810,6 +817,7 @@ static Exit_status dump_single_log(PRINT_EVENT_INFO *print_event_info,
                                    const char *logname);
 static Exit_status dump_multiple_logs(int argc, char **argv);
 static Exit_status safe_connect();
+static Exit_status safe_connect_for_rollback();
 
 struct buff_event_info buff_event;
 
@@ -1396,6 +1404,7 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
   Exit_status retval = OK_CONTINUE;
   IO_CACHE *const head = &print_event_info->head_cache;
   ev->is_analysis_mode = opt_analysis_mode;
+  ev->is_rollback_mode= opt_rollback_mode;
 
   /*
     Format events are not concerned by --offset and such, we always need to
@@ -1635,6 +1644,22 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
           ev = nullptr;
           goto end;
         }
+        if (opt_rollback_mode) {
+          MYSQL_RES *columns_info = nullptr;
+          std::string query = "select column_name from "
+                              "information_schema.columns where table_schema "
+                              "like '" + std::string(map->get_db_name()) +
+                              "' and table_name like '" + 
+                              std::string(map->get_table_name()) +
+                              "' order by ordinal_position";
+          mysql_query(mysql_for_rollback, query.c_str());
+          columns_info = mysql_store_result(mysql_for_rollback);
+          MYSQL_ROW row;
+          rollback_column_names.clear();
+          while ((row = mysql_fetch_row(columns_info))) {
+            rollback_column_names.push_back(row[0]);
+          }
+        }
       }
         [[fallthrough]];
       case binary_log::ROWS_QUERY_LOG_EVENT:
@@ -1696,7 +1721,7 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
               my_b_printf(body_cache, "'%s\n", print_event_info->delimiter);
 
             // flush cache
-            if (!opt_analysis_mode) {
+            if (!opt_analysis_mode && !opt_rollback_mode) {
               if (copy_event_cache_to_file_and_reinit(
                      &print_event_info->head_cache, result_file,
                      stop_never /* flush result_file */) ||
@@ -1749,7 +1774,7 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
         /* Flush head,body and footer cache to result_file */
         if (stmt_end) {
           print_event_info->have_unflushed_events = false;
-          if (!opt_analysis_mode) {
+          if (!opt_analysis_mode && !opt_rollback_mode) {
             if (copy_event_cache_to_file_and_reinit(
                     &print_event_info->head_cache, result_file,
                     stop_never /* flush result file */) ||
@@ -1810,6 +1835,12 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
           }
           current_analysis_info.sql_statistics.clear();
         }
+        if (ev->is_rollback_mode) {
+          rollback_transaction.first = current_gtid;
+          rollback_transactions.push_back(rollback_transaction);
+          rollback_transaction.second.clear();
+          rollback_transaction.first.clear();
+        }
         if (head->error == -1) goto err;
         break;
       }
@@ -1827,7 +1858,7 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
         if (head->error == -1) goto err;
     }
     /* Flush head cache to result_file for every event */
-    if (!opt_analysis_mode) {
+    if (!opt_analysis_mode && !opt_rollback_mode) {
       if (copy_event_cache_to_file_and_reinit(&print_event_info->head_cache,
                                               result_file,
                                               stop_never /* flush result_file */))
@@ -2108,6 +2139,10 @@ static struct my_option my_long_options[] = {
      "Sort the binlog analysis information by the execution time.",
      &opt_analysis_sort, &opt_analysis_sort, nullptr, GET_BOOL, NO_ARG, 0, 0, 0,
      nullptr, 0, nullptr},
+    {"rollback-mode", OPT_ROLLBACK_MODE,
+     "Generate the rollback SQL statements to the corresponding DML operations.",
+     &opt_rollback_mode, &opt_rollback_mode, nullptr, GET_BOOL, NO_ARG, 0, 0, 0,
+     nullptr, 0, nullptr},
     {"include-gtids", OPT_MYSQLBINLOG_INCLUDE_GTIDS,
      "Print events whose Global Transaction Identifiers "
      "were provided.",
@@ -2221,6 +2256,7 @@ static void cleanup() {
   delete buff_ev;
 
   if (mysql) mysql_close(mysql);
+  if (mysql_for_rollback) mysql_close(mysql_for_rollback);
 }
 
 static void usage() {
@@ -2444,6 +2480,59 @@ static Exit_status safe_connect() {
   return OK_CONTINUE;
 }
 
+static Exit_status safe_connect_for_rollback() {
+  mysql_close(mysql_for_rollback);
+  mysql_for_rollback = mysql_init(nullptr);
+
+  if (!mysql_for_rollback) {
+    error("Failed on mysql_init.");
+    return ERROR_STOP;
+  }
+
+  if (SSL_SET_OPTIONS(mysql_for_rollback)) {
+    error("%s", SSL_SET_OPTIONS_ERROR);
+    return ERROR_STOP;
+  }
+  if (opt_plugin_dir && *opt_plugin_dir)
+    mysql_options(mysql_for_rollback, MYSQL_PLUGIN_DIR, opt_plugin_dir);
+
+  if (opt_compress_algorithm)
+    mysql_options(mysql_for_rollback, MYSQL_OPT_COMPRESSION_ALGORITHMS,
+                  opt_compress_algorithm);
+
+  mysql_options(mysql_for_rollback, MYSQL_OPT_ZSTD_COMPRESSION_LEVEL,
+                &opt_zstd_compress_level);
+
+  if (opt_default_auth && *opt_default_auth)
+    mysql_options(mysql_for_rollback, MYSQL_DEFAULT_AUTH, opt_default_auth);
+
+  if (opt_protocol)
+    mysql_options(mysql_for_rollback, MYSQL_OPT_PROTOCOL, (char *)&opt_protocol);
+  if (opt_bind_addr) mysql_options(mysql_for_rollback, MYSQL_OPT_BIND, opt_bind_addr);
+
+  if (opt_compress) mysql_options(mysql_for_rollback, MYSQL_OPT_COMPRESS, NullS);
+
+#if defined(_WIN32)
+  if (shared_memory_base_name)
+    mysql_options(mysql, MYSQL_SHARED_MEMORY_BASE_NAME,
+                  shared_memory_base_name);
+#endif
+  mysql_options(mysql_for_rollback, MYSQL_OPT_CONNECT_ATTR_RESET, nullptr);
+  mysql_options4(mysql_for_rollback, MYSQL_OPT_CONNECT_ATTR_ADD, "program_name",
+                 "mysqlbinlog");
+  mysql_options4(mysql_for_rollback, MYSQL_OPT_CONNECT_ATTR_ADD, "_client_role",
+                 "binary_log_listener");
+  set_server_public_key(mysql_for_rollback);
+  set_get_server_public_key_option(mysql_for_rollback);
+
+  if (!mysql_real_connect(mysql_for_rollback, host, user, pass, nullptr, port, sock, 0)) {
+    error("Failed on connect: %s", mysql_error(mysql_for_rollback));
+    return ERROR_STOP;
+  }
+  mysql_for_rollback->reconnect = true;
+  return OK_CONTINUE;
+}
+
 /**
   High-level function for dumping a named binlog.
 
@@ -2488,7 +2577,7 @@ static Exit_status dump_multiple_logs(int argc, char **argv) {
      Set safe delimiter, to dump things
      like CREATE PROCEDURE safely
   */
-  if (!raw_mode && !opt_analysis_mode) {
+  if (!raw_mode && !opt_analysis_mode && !opt_rollback_mode) {
     fprintf(result_file, "DELIMITER /*!*/;\n");
   }
   my_stpcpy(print_event_info.delimiter, "/*!*/;");
@@ -2534,7 +2623,7 @@ static Exit_status dump_multiple_logs(int argc, char **argv) {
         "from the partial statement have not been written to output.");
 
   /* Set delimiter back to semicolon */
-  if (!raw_mode && !opt_analysis_mode) {
+  if (!raw_mode && !opt_analysis_mode && !opt_rollback_mode) {
     if (print_event_info.skipped_event_in_transaction)
       fprintf(result_file, "COMMIT /* added by mysqlbinlog */%s\n",
               print_event_info.delimiter);
@@ -2690,6 +2779,7 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
     (COM_BINLOG_DUMP kills the thread when it finishes).
   */
   if ((retval = safe_connect()) != OK_CONTINUE) return retval;
+  if ((retval = safe_connect_for_rollback()) != OK_CONTINUE) return retval;
 
   if ((retval = check_master_version()) != OK_CONTINUE) return retval;
 
@@ -3333,6 +3423,14 @@ int main(int argc, char **argv) {
     error("The --analysis-sort option is only allowed with --analysis-mode");
     return EXIT_FAILURE;
   }
+  if (opt_rollback_mode && verbose == 0) {
+    error("The --rollback-mode option requires --verbose");
+    return EXIT_FAILURE;
+  }
+  if (opt_rollback_mode && opt_analysis_mode) {
+    error("The --rollback-mode option cannot be used with --analysis-mode");
+    return EXIT_FAILURE;
+  }
 
   umask(((~my_umask) & 0666));
   /* Check for argument conflicts and do any post-processing */
@@ -3359,7 +3457,7 @@ int main(int argc, char **argv) {
   else
     load_processor.init_by_cur_dir();
 
-  if (!raw_mode && !opt_analysis_mode) {
+  if (!raw_mode && !opt_analysis_mode && !opt_rollback_mode) {
     fprintf(
         result_file,
         "# The proper term is pseudo_replica_mode, but we use this "
@@ -3398,13 +3496,13 @@ int main(int argc, char **argv) {
     fprintf(result_file,
             "/*!50700 SET @@SESSION.RBR_EXEC_MODE=IDEMPOTENT*/;\n\n");
 
-  if (opt_require_row_format && !opt_analysis_mode) {
+  if (opt_require_row_format && !opt_analysis_mode && !opt_rollback_mode) {
     fprintf(result_file, "/*!80019 SET @@SESSION.REQUIRE_ROW_FORMAT=1*/;\n\n");
   }
 
   retval = dump_multiple_logs(argc, argv);
 
-  if (!raw_mode && !opt_analysis_mode) {
+  if (!raw_mode && !opt_analysis_mode && !opt_rollback_mode) {
     fprintf(result_file, "# End of log file\n");
 
     fprintf(result_file,
@@ -3442,12 +3540,24 @@ int main(int argc, char **argv) {
       }
     }
   }
+  if (opt_rollback_mode) {
+    for (auto transaction = rollback_transactions.rbegin();
+         transaction != rollback_transactions.rend(); ++transaction) {
+      const std::string &gtid = transaction->first;
+      printf("BEGIN; /* %s */\n", gtid.c_str());
+      const std::vector<std::string> &sqls = transaction->second;
+      for (auto sql = sqls.rbegin(); sql != sqls.rend(); ++sql) {
+        printf("%s\n", sql->c_str());
+      }
+      printf("COMMIT;\n");
+    }
+  }
 
   /*
     We should unset the RBR_EXEC_MODE since the user may concatenate output of
     multiple runs of mysqlbinlog, all of which may not run in idempotent mode.
    */
-  if (idempotent_mode && !opt_analysis_mode)
+  if (idempotent_mode && !opt_analysis_mode && !opt_rollback_mode)
     fprintf(result_file, "/*!50700 SET @@SESSION.RBR_EXEC_MODE=STRICT*/;\n");
 
   if (tmpdir.list) free_tmpdir(&tmpdir);

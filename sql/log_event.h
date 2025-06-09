@@ -121,6 +121,11 @@ struct Binlog_analysis_info {
 extern Binlog_analysis_info current_analysis_info;
 extern std::vector<std::pair<std::string, Binlog_analysis_info>> binlog_analysis_vec;
 extern const size_t max_binlog_analysis_vec_size;
+extern std::string rollback_sql;
+extern std::vector<std::string> rollback_sql_columns;
+extern std::vector<std::string> rollback_column_names;
+extern std::pair<std::string, std::vector<std::string>> rollback_transaction;
+extern std::vector<std::pair<std::string, std::vector<std::string>>> rollback_transactions;
 
 /* Forward declarations */
 using binary_log::Binary_log_event;
@@ -854,6 +859,7 @@ class Log_event {
     transactions.
   */
   bool is_analysis_mode;
+  bool is_rollback_mode;
 #ifdef MYSQL_SERVER
   THD *thd;
   /**
