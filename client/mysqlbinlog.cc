@@ -712,7 +712,7 @@ static const char *default_dbug_option = "d:t:o,/tmp/mysqlbinlog.trace";
 #endif
 static const char *load_default_groups[] = {"mysqlbinlog", "client", nullptr};
 
-static bool one_database = false, disable_log_bin = false;
+static bool one_database = false, one_table = false, disable_log_bin = false;
 static bool opt_hexdump = false;
 const char *base64_output_mode_names[] = {"NEVER", "AUTO", "UNSPEC",
                                           "DECODE-ROWS", NullS};
@@ -733,6 +733,7 @@ static enum enum_remote_proto {
 } opt_remote_proto = BINLOG_LOCAL;
 static char *opt_remote_proto_str = nullptr;
 static char *database = nullptr;
+static char *filtered_table = nullptr;
 static char *output_file = nullptr;
 static char *rewrite = nullptr;
 bool force_opt = false, short_form = false, idempotent_mode = false;
@@ -1100,6 +1101,20 @@ static void convert_path_to_forward_slashes(char *fname) {
 static bool shall_skip_database(const char *log_dbname) {
   return one_database && (log_dbname != nullptr) &&
          strcmp(log_dbname, database);
+}
+
+/**
+  Indicates whether the given table should be filtered out,
+  according to the --table=X option.
+
+  @param log_table_name Name of table.
+
+  @return nonzero if the table with the given name should be
+  filtered out, 0 otherwise.
+*/
+static bool shall_skip_table(const char *log_table_name) {
+  return one_table && (log_table_name != nullptr) &&
+         strcmp(log_table_name, filtered_table);
 }
 
 static std::string my_getlocaltime(ulong ts) {
@@ -1637,7 +1652,8 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
       }
       case binary_log::TABLE_MAP_EVENT: {
         Table_map_log_event *map = ((Table_map_log_event *)ev);
-        if (shall_skip_database(map->get_db_name())) {
+        if (shall_skip_database(map->get_db_name()) ||
+            shall_skip_table(map->get_table_name())) {
           print_event_info->skipped_event_in_transaction = true;
           print_event_info->m_table_map_ignored.set_table(map->get_table_id(),
                                                           map);
@@ -1652,8 +1668,20 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
                               "' and table_name like '" + 
                               std::string(map->get_table_name()) +
                               "' order by ordinal_position";
-          mysql_query(mysql_for_rollback, query.c_str());
-          columns_info = mysql_store_result(mysql_for_rollback);
+          if (mysql_query(mysql_for_rollback, query.c_str()) ||
+          !(columns_info = mysql_store_result(mysql_for_rollback))) {
+            error("Failed to get column names for table %s.%s: %s",
+                  map->get_db_name(), map->get_table_name(),
+                  mysql_error(mysql_for_rollback));
+            goto err;
+          }
+          if (mysql_num_rows(columns_info) == 0) {
+            error("Failed to get column names for table %s.%s: "
+                  "table does not exist",
+                  map->get_db_name(), map->get_table_name());
+            mysql_free_result(columns_info);
+            goto err;
+          }
           MYSQL_ROW row;
           rollback_column_names.clear();
           while ((row = mysql_fetch_row(columns_info))) {
@@ -1845,9 +1873,9 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
         break;
       }
       case binary_log::PREVIOUS_GTIDS_LOG_EVENT:
-        if (one_database && !opt_skip_gtids)
+        if ((one_database || one_table) && !opt_skip_gtids)
           warning(
-              "The option --database has been used. It may filter "
+              "The option --database/--table has been used. It may filter "
               "parts of transactions, but will include the GTIDs in "
               "any case. If you want to exclude or include transactions, "
               "you should use the options --exclude-gtids or "
@@ -1908,6 +1936,9 @@ static struct my_option my_long_options[] = {
      nullptr, GET_STR, REQUIRED_ARG, 0, 0, 0, nullptr, 0, nullptr},
     {"database", 'd', "List entries for just this database (local log only).",
      &database, &database, nullptr, GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0,
+     nullptr, 0, nullptr},
+    {"table", 'T', "List entries for just this table (local log only).",
+     &filtered_table, &filtered_table, nullptr, GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0,
      nullptr, 0, nullptr},
     {"rewrite-db", OPT_REWRITE_DB,
      "Rewrite the row event to point so that "
@@ -2304,6 +2335,9 @@ extern "C" bool get_one_option(int optid, const struct my_option *opt,
 
     case 'd':
       one_database = true;
+      break;
+    case 'T':
+      one_table = true;
       break;
     case OPT_REWRITE_DB: {
       char *from_db = argument, *p, *to_db;
@@ -3276,6 +3310,9 @@ static int args_post_process(void) {
   if (raw_mode) {
     if (one_database)
       warning("The --database option is ignored with --raw mode");
+
+    if (one_table)
+      warning("The --one-table option is ignored with --raw mode");
 
     if (opt_remote_proto == BINLOG_LOCAL) {
       error(
