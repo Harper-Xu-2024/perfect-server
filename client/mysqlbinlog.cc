@@ -1856,14 +1856,15 @@ static Exit_status process_event(PRINT_EVENT_INFO *print_event_info,
             for (const auto &sql_statistic :
               current_analysis_info.sql_statistics) {
               printf("    '%s':\n", sql_statistic.first.c_str());
-              for (const auto &table : sql_statistic.second) {
-                printf("      '%s': %d\n", table.first.c_str(), table.second);
+              for (const auto &analysis_table : sql_statistic.second) {
+                printf("      '%s': %d\n", analysis_table.first.c_str(),
+                       analysis_table.second);
               }
             }
           }
           current_analysis_info.sql_statistics.clear();
         }
-        if (ev->is_rollback_mode) {
+        if (ev->is_rollback_mode && !rollback_transaction.second.empty()) {
           rollback_transaction.first = current_gtid;
           rollback_transactions.push_back(rollback_transaction);
           rollback_transaction.second.clear();
